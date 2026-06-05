@@ -1,60 +1,273 @@
 import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
+import io
+import matplotlib.pyplot as plt
+import zipfile
+import pandas as pd
 
-# Import the math functions from our engine file
-import svd_engine as svd
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="SVD Image Compressor",
+    page_icon="🖼️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# App Setup
-st.set_page_config(layout="wide", page_title="SVD Image Compressor")
-st.title("🖼️ End-to-End SVD Image Compressor")
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@300;400;600&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    h1, h2, h3 { font-family: 'Space Mono', monospace; }
+    .metric-card {
+        background: linear-gradient(135deg, #1e2130, #252a3a);
+        border: 1px solid #2e3450;
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+        margin: 6px 0;
+    }
+    .metric-card .value { font-size: 2rem; font-weight: 700; font-family: 'Space Mono', monospace; color: #4f8ef7; }
+    .metric-card .label { font-size: 0.78rem; color: #8892a4; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+    .section-header {
+        font-family: 'Space Mono', monospace; font-size: 1rem; color: #4f8ef7;
+        text-transform: uppercase; letter-spacing: 2px;
+        border-bottom: 1px solid #2e3450; padding-bottom: 8px; margin: 24px 0 16px 0;
+    }
+    .stButton>button {
+        background: linear-gradient(135deg, #4f8ef7, #7c5cfc);
+        color: white; border: none; border-radius: 8px;
+        padding: 10px 24px; font-family: 'Space Mono', monospace; font-size: 0.85rem; width: 100%;
+    }
+    .comparison-label { text-align: center; font-size: 0.8rem; color: #8892a4; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+    .tip-box { background: #1a2235; border-left: 3px solid #4f8ef7; border-radius: 6px; padding: 12px 16px; font-size: 0.85rem; color: #a0aec0; margin: 12px 0; }
+</style>
+""", unsafe_allow_html=True)
 
-# Step 1: Dynamic File Upload replaces hardcoded 'your_image.jpg'
-uploaded_file = st.file_uploader("C:\\Users\\komal\\Downloads\download.jpg", type=["jpg", "jpeg", "png"])
 
-if uploaded_file is not None:
-    # Safely handle format conversion to ensure 3 color channels
-    img = Image.open(uploaded_file).convert('RGB')
-    img_array = np.array(img) / 255.0
-    
-    height, width, _ = img_array.shape
-    max_possible_rank = min(height, width)
-    
-    # Separate channels
-    R, G, B = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
-    
-    # Step 2: Dynamic User Input replaces fixed ranks list
-    st.sidebar.header("Parameters")
-    r = st.sidebar.slider("Select Target Rank Component", 1, int(max_possible_rank), int(max_possible_rank * 0.1))
-    
-    # Step 3: Run execution pipeline dynamically based on slider
-    with st.spinner("Recomputing SVD Matrices..."):
-        R_compressed = svd.compress_channel(R, r)
-        G_compressed = svd.compress_channel(G, r)
-        B_compressed = svd.compress_channel(B, r)
-        
-        compressed_img = np.clip(np.stack([R_compressed, G_compressed, B_compressed], axis=2), 0.0, 1.0)
-        
-        # Calculate stats
-        original_elements = R.shape[0] * R.shape[1]
-        compressed_elements = r * (R.shape[0] + R.shape[1] + 1)
-        storage_percentage = (compressed_elements / original_elements) * 100
-        
-        energy_curve = svd.get_energy_data(R)
-        energy_retained = energy_curve[r - 1] * 100
+# ── Core SVD functions ────────────────────────────────────────────────────────
 
-    # Step 4: Display Output on Screen
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Original Image")
-        st.image(img_array, use_container_width=True, caption=f"Rank: {max_possible_rank}")
-    with col2:
-        st.subheader(f"Compressed Image")
-        st.image(compressed_img, use_container_width=True, caption=f"Rank: {r}")
-        
-    # Metrics display
+def compute_svd(channel):
+    return np.linalg.svd(channel.astype(float), full_matrices=False)
+
+def reconstruct(U, Sigma, Vt, r):
+    r = max(1, min(r, len(Sigma)))
+    return np.clip(np.dot(U[:, :r], np.dot(np.diag(Sigma[:r]), Vt[:r, :])), 0, 255)
+
+def compress_image(img_array, rank, mode="RGB"):
+    if mode == "Grayscale":
+        gray = np.mean(img_array, axis=2)
+        U, S, Vt = compute_svd(gray)
+        result = reconstruct(U, S, Vt, rank)
+        return np.stack([result]*3, axis=2).astype(np.uint8), [S]
+    channels, sigmas = [], []
+    for i in range(3):
+        U, S, Vt = compute_svd(img_array[:,:,i])
+        channels.append(reconstruct(U, S, Vt, rank))
+        sigmas.append(S)
+    return np.stack(channels, axis=2).astype(np.uint8), sigmas
+
+def energy_at_rank(sigma, r):
+    r = max(1, min(r, len(sigma)))
+    return np.sum(sigma[:r]**2) / np.sum(sigma**2) * 100
+
+def auto_rank(sigma, target=90):
+    total = np.sum(sigma**2)
+    hits = np.where(np.cumsum(sigma**2) / total >= target / 100)[0]
+    return int(hits[0]) + 1 if len(hits) > 0 else len(sigma)
+
+def file_size_kb(img_array, fmt="JPEG"):
+    buf = io.BytesIO()
+    Image.fromarray(img_array.astype(np.uint8)).save(buf, format=fmt)
+    return buf.tell() / 1024
+
+def storage_pct(m, n, r):
+    return r * (m + n + 1) / (m * n) * 100
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("## ⚙️ Controls")
+    mode = st.radio("Image Mode", ["RGB", "Grayscale"], horizontal=True)
     st.markdown("---")
-    m1, m2 = st.columns(2)
-    m1.metric("Storage Size (per channel)", f"{storage_percentage:.1f}%")
-    m2.metric("Mathematical Variance Retained", f"{energy_retained:.1f}%")
+    st.markdown("### Rank Selection")
+    auto_optimize = st.button("✨ Auto Optimize (90% energy)")
+    target_energy = st.slider("Target energy %", 50, 99, 90)
+    rank = st.slider("Manual Rank", min_value=1, max_value=200, value=50)
+    st.markdown("---")
+    st.markdown("### Batch Compression")
+    batch_files = st.file_uploader(
+        "Upload multiple images",
+        type=["jpg","jpeg","png","bmp","webp","tiff"],
+        accept_multiple_files=True, key="batch"
+    )
+    st.markdown('---')
+    st.markdown('<div class="tip-box">💡 Lower rank = smaller file, less detail.<br>Higher rank = larger file, more detail.</div>', unsafe_allow_html=True)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+st.markdown("# 🖼️ SVD Image Compressor")
+st.markdown("Compress images using **Singular Value Decomposition** — rank-1 matrix decomposition in action.")
+
+uploaded_file = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","webp","tiff"])
+
+if uploaded_file:
+    img = Image.open(uploaded_file).convert("RGB")
+    img_array = np.array(img)
+    m, n = img_array.shape[:2]
+    max_rank = min(m, n)
+
+    U0, S0, Vt0 = compute_svd(img_array[:,:,0])
+
+    if auto_optimize:
+        rank = auto_rank(S0, target_energy)
+        st.sidebar.success(f"Auto rank set to **{rank}** for {target_energy}% energy")
+
+    rank = min(rank, max_rank)
+    compressed_array, sigmas = compress_image(img_array, rank, mode)
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    orig_kb   = file_size_kb(img_array)
+    comp_kb   = file_size_kb(compressed_array)
+    stor_pct  = storage_pct(m, n, rank)
+    eng_pct   = energy_at_rank(sigmas[0], rank)
+    saved_pct = max(0, (1 - comp_kb / orig_kb) * 100)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    for col, val, label in zip(
+        [c1,c2,c3,c4,c5],
+        [f"{orig_kb:.0f} KB", f"{comp_kb:.0f} KB", f"{saved_pct:.1f}%", f"{stor_pct:.1f}%", f"{eng_pct:.1f}%"],
+        ["Original Size","Compressed Size","Space Saved","Storage Used","Energy Preserved"]
+    ):
+        col.markdown(f'<div class="metric-card"><div class="value">{val}</div><div class="label">{label}</div></div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Image comparison ──────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Image Comparison</div>', unsafe_allow_html=True)
+    col_orig, col_comp = st.columns(2)
+    with col_orig:
+        st.markdown('<div class="comparison-label">Original</div>', unsafe_allow_html=True)
+        st.image(img_array, use_column_width=True)
+    with col_comp:
+        st.markdown(f'<div class="comparison-label">Compressed — Rank {rank}</div>', unsafe_allow_html=True)
+        st.image(compressed_array, use_column_width=True)
+
+    buf = io.BytesIO()
+    Image.fromarray(compressed_array).save(buf, format="JPEG")
+    st.download_button("⬇️ Download Compressed Image", buf.getvalue(), file_name=f"compressed_rank{rank}.jpg", mime="image/jpeg")
+
+    st.markdown("---")
+
+    # ── Rank comparison table ─────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Rank Comparison Table</div>', unsafe_allow_html=True)
+    rows = []
+    for r in [5, 10, 25, 50, 75, 100]:
+        if r > max_rank: continue
+        arr, sigs = compress_image(img_array, r, mode)
+        rows.append({
+            "Rank": r,
+            "Storage Used": f"{storage_pct(m,n,r):.1f}%",
+            "Energy Preserved": f"{energy_at_rank(sigs[0],r):.1f}%",
+            "Compressed Size": f"{file_size_kb(arr):.0f} KB",
+            "Space Saved": f"{max(0,(1-file_size_kb(arr)/orig_kb)*100):.1f}%"
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Charts ────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Analysis Charts</div>', unsafe_allow_html=True)
+    ch1, ch2 = st.columns(2)
+
+    with ch1:
+        st.markdown("**Cumulative Energy Preservation**")
+        fig, ax = plt.subplots(figsize=(5,3))
+        fig.patch.set_facecolor('#1e2130'); ax.set_facecolor('#1e2130')
+        colors = ['#e05c7a','#4caf8e','#4f8ef7']
+        labels = ['R','G','B'] if mode=="RGB" else ['Gray']
+        for sig, color, lbl in zip(sigmas, colors, labels):
+            xs = range(1, min(200,len(sig))+1)
+            ax.plot(xs, [energy_at_rank(sig,r) for r in xs], color=color, linewidth=2, label=lbl)
+        ax.axvline(x=rank, color='white', linestyle='--', linewidth=1, alpha=0.6, label=f'Rank {rank}')
+        ax.axhline(y=90, color='#f5c842', linestyle=':', linewidth=1, alpha=0.6, label='90% energy')
+        ax.set_xlabel("Rank", color='#8892a4', fontsize=9); ax.set_ylabel("Energy %", color='#8892a4', fontsize=9)
+        ax.tick_params(colors='#8892a4', labelsize=8)
+        for spine in ax.spines.values(): spine.set_edgecolor('#2e3450')
+        ax.legend(fontsize=8, facecolor='#1e2130', labelcolor='white', framealpha=0.5)
+        st.pyplot(fig); plt.close(fig)
+
+    with ch2:
+        st.markdown("**Singular Values Distribution**")
+        fig, ax = plt.subplots(figsize=(5,3))
+        fig.patch.set_facecolor('#1e2130'); ax.set_facecolor('#1e2130')
+        top_n = min(80, len(sigmas[0]))
+        for sig, color, lbl in zip(sigmas, ['#e05c7a','#4caf8e','#4f8ef7'], ['R','G','B'] if mode=="RGB" else ['Gray']):
+            ax.bar(range(1,top_n+1), sig[:top_n], color=color, alpha=0.6, label=lbl, width=1.0)
+        ax.axvline(x=rank, color='white', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Rank {rank}')
+        ax.set_xlabel("Singular Value Index", color='#8892a4', fontsize=9); ax.set_ylabel("Magnitude", color='#8892a4', fontsize=9)
+        ax.tick_params(colors='#8892a4', labelsize=8)
+        for spine in ax.spines.values(): spine.set_edgecolor('#2e3450')
+        ax.legend(fontsize=8, facecolor='#1e2130', labelcolor='white', framealpha=0.5)
+        st.pyplot(fig); plt.close(fig)
+
+    # Channel-wise curves (RGB only)
+    if mode == "RGB":
+        st.markdown("---")
+        st.markdown('<div class="section-header">Channel-wise Energy at Current Rank</div>', unsafe_allow_html=True)
+        for col, sig, name, color in zip(
+            st.columns(3), sigmas,
+            ["Red Channel","Green Channel","Blue Channel"],
+            ["#e05c7a","#4caf8e","#4f8ef7"]
+        ):
+            e = energy_at_rank(sig, rank)
+            fig, ax = plt.subplots(figsize=(3.5,2.5))
+            fig.patch.set_facecolor('#1e2130'); ax.set_facecolor('#1e2130')
+            xs = range(1, min(150,len(sig))+1)
+            ax.plot(xs, [energy_at_rank(sig,r) for r in xs], color=color, linewidth=2)
+            ax.axvline(x=rank, color='white', linestyle='--', linewidth=1, alpha=0.7)
+            ax.set_title(f"{name}\n{e:.1f}% energy", color='white', fontsize=9)
+            ax.tick_params(colors='#8892a4', labelsize=7)
+            for spine in ax.spines.values(): spine.set_edgecolor('#2e3450')
+            col.pyplot(fig); plt.close(fig)
+
+    st.markdown("---")
+
+    # ── SVD vs JPEG ───────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">SVD vs JPEG Comparison</div>', unsafe_allow_html=True)
+    cmp_rows = []
+    for q in [10, 30, 60, 90]:
+        buf_j = io.BytesIO()
+        Image.fromarray(img_array).save(buf_j, format="JPEG", quality=q)
+        j_kb = buf_j.tell() / 1024
+        cmp_rows.append({"Method": f"JPEG quality={q}", "File Size (KB)": f"{j_kb:.0f} KB", "Space Saved": f"{max(0,(1-j_kb/orig_kb)*100):.1f}%"})
+    cmp_rows.append({"Method": f"SVD rank={rank}", "File Size (KB)": f"{comp_kb:.0f} KB", "Space Saved": f"{saved_pct:.1f}%"})
+    st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
+
+
+# ── Batch ─────────────────────────────────────────────────────────────────────
+if batch_files:
+    st.markdown("---")
+    st.markdown('<div class="section-header">Batch Compression</div>', unsafe_allow_html=True)
+    batch_rank = st.slider("Rank for batch images", 1, 200, 50, key="batch_rank")
+    if st.button("🗜️ Compress All & Download ZIP"):
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            progress = st.progress(0)
+            for idx, f in enumerate(batch_files):
+                barr = np.array(Image.open(f).convert("RGB"))
+                br = min(batch_rank, min(barr.shape[:2]))
+                comp_b, _ = compress_image(barr, br, "RGB")
+                img_buf = io.BytesIO()
+                Image.fromarray(comp_b).save(img_buf, format="JPEG")
+                zf.writestr(f"compressed_{f.name}", img_buf.getvalue())
+                progress.progress((idx+1)/len(batch_files))
+        st.download_button("⬇️ Download ZIP", zip_buf.getvalue(), file_name="svd_compressed.zip", mime="application/zip")
+        st.success(f"✅ {len(batch_files)} images compressed!")
+
+elif not uploaded_file:
+    st.markdown("---")
+    st.info("👆 Upload an image above to get started, or upload multiple images in the sidebar for batch compression.")
