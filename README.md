@@ -1,5 +1,5 @@
 # 🖼️ SVD Image Compressor
-
+  🌐 Live Demo: https://svd-image-compreappr-n5gmdosgmvagzfgqw3x7u8.streamlit.app/
 An interactive web application that compresses images using
 **Singular Value Decomposition (SVD)** — bridging pure linear
 algebra with real-world computer vision.
